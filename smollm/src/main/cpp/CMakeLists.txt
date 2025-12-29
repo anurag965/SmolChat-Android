@@ -64,6 +64,11 @@ set(SMOLLM_SOURCES
         ${COMMON_DIR}/ngram-cache.cpp
         ${COMMON_DIR}/sampling.cpp
 
+        ${LLAMA_DIR}/tools/mtmd/mtmd.cpp
+        ${LLAMA_DIR}/tools/mtmd/mtmd-helper.cpp
+        ${LLAMA_DIR}/tools/mtmd/clip.cpp
+        ${LLAMA_DIR}/tools/mtmd/mtmd-audio.cpp
+
         LLMInference.cpp
         smollm.cpp
 )
@@ -105,6 +110,7 @@ function(build_library target_name)
             ${GGML_DIR}/src
             ${GGML_DIR}/src/ggml-cpu
             ${LLAMA_DIR}/include
+            ${LLAMA_DIR}/tools/mtmd
             ${VENDOR_DIR}
     )
 

@@ -34,11 +34,8 @@ android {
                 // allow compiling 16 KB page-aligned shared libraries
                 // https://developer.android.com/guide/practices/page-sizes#compile-r27
                 arguments += listOf("-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON")
-                arguments += "-DCMAKE_BUILD_TYPE=Release"
-
-                // (debugging) uncomment the following line to enable debug builds
-                // and attach hardware-assisted address sanitizer
-                // arguments += "-DCMAKE_BUILD_TYPE=Debug"
+                // ANDROID_SANITIZE=hwaddress is only supported on arm64-v8a.
+                // It is disabled here to prevent build failures on x86/x86_64 targets.
                 // arguments += listOf("-DANDROID_SANITIZE=hwaddress")
             }
         }
@@ -48,6 +45,18 @@ android {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            externalNativeBuild {
+                cmake {
+                    arguments += "-DCMAKE_BUILD_TYPE=Release"
+                }
+            }
+        }
+        debug {
+            externalNativeBuild {
+                cmake {
+                    arguments += "-DCMAKE_BUILD_TYPE=Debug"
+                }
+            }
         }
     }
     compileOptions {

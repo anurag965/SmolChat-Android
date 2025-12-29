@@ -1,19 +1,3 @@
-/*
- * Copyright (C) 2024 Shubham Panchal
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 package io.shubham0204.smollm
 
 import android.os.Build
@@ -24,10 +8,14 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileNotFoundException
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 /** This class interacts with the JNI binding and provides a Kotlin API to infer a GGUF LLM model */
 class SmolLM {
     companion object {
+        private const val i8mmEnabled = true
+
         init {
             val logTag = SmolLM::class.java.simpleName
 
@@ -53,8 +41,6 @@ class SmolLM {
             Log.d(logTag, "- isAtLeastArmV84: $isAtLeastArmV84")
 
             // Check if the app is running in an emulated device
-            // Note, this is not the OFFICIAL way to check if the app is running
-            // on an emulator
             val isEmulated =
                 (Build.HARDWARE.contains("goldfish") || Build.HARDWARE.contains("ranchu"))
             Log.d(logTag, "isEmulated: $isEmulated")
@@ -67,7 +53,7 @@ class SmolLM {
                     } else if (isAtLeastArmV84 && hasSve && hasFp16 && hasDotProd) {
                         Log.d(logTag, "Loading libsmollm_v8_4_fp16_dotprod_sve.so")
                         System.loadLibrary("smollm_v8_4_fp16_dotprod_sve")
-                    } else if (isAtLeastArmV84 && hasI8mm && hasFp16 && hasDotProd) {
+                    } else if (isAtLeastArmV84 && i8mmEnabled && hasI8mm && hasFp16 && hasDotProd) {
                         Log.d(logTag, "Loading libsmollm_v8_4_fp16_dotprod_i8mm.so")
                         System.loadLibrary("smollm_v8_4_fp16_dotprod_i8mm")
                     } else if (isAtLeastArmV84 && hasFp16 && hasDotProd) {
@@ -92,8 +78,6 @@ class SmolLM {
                     System.loadLibrary("smollm")
                 }
             } else {
-                // load the default native library with no ARM
-                // specific instructions
                 Log.d(logTag, "Loading default libsmollm.so")
                 System.loadLibrary("smollm")
             }
@@ -118,7 +102,9 @@ class SmolLM {
         private fun supportsArm64V8a(): Boolean = Build.SUPPORTED_ABIS[0].equals("arm64-v8a")
     }
 
+    // Native LLMInference pointer
     private var nativePtr = 0L
+    private val ptrLock = ReentrantLock()
 
     /**
      * Provides default values for inference parameters. These values are used when the
@@ -131,27 +117,6 @@ class SmolLM {
             "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<|im_start|>system You are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|> ' }}{% endif %}{{'<|im_start|>' + message['role'] + ' ' + message['content'] + '<|im_end|>' + ' '}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant ' }}{% endif %}"
     }
 
-    /**
-     * Data class to hold the inference parameters for the LLM.
-     *
-     * @property minP The minimum probability for a token to be considered. Also known as top-P
-     *   sampling. (Default: 0.1f)
-     * @property temperature The temperature for sampling. Higher values make the output more
-     *   random. (Default: 0.8f)
-     * @property storeChats Whether to store the chat history in memory. If true, the LLM will
-     *   remember previous interactions in the current session. (Default: true)
-     * @property contextSize The context size (in tokens) for the LLM. This determines how much of
-     *   the previous conversation the LLM can "remember". If null, the value from the GGUF model
-     *   file will be used, or a default value if not present in the model file. (Default: null)
-     * @property chatTemplate The chat template to use for formatting the conversation. This is a
-     *   Jinja2 template string. If null, the value from the GGUF model file will be used, or a
-     *   default value if not present in the model file. (Default: null)
-     * @property numThreads The number of threads to use for inference. (Default: 4)
-     * @property useMmap Whether to use memory-mapped file I/O for loading the model. This can
-     *   improve loading times and reduce memory usage. (Default: true)
-     * @property useMlock Whether to lock the model in memory. This can prevent the model from being
-     *   swapped out to disk, potentially improving performance. (Default: false)
-     */
     data class InferenceParams(
         val minP: Float = 0.1f,
         val temperature: Float = 0.8f,
@@ -163,19 +128,6 @@ class SmolLM {
         val useMlock: Boolean = false,
     )
 
-    /**
-     * Loads the GGUF model from the given path. This function will read the metadata from the GGUF
-     * model file, such as the context size and chat template, and use them if they are not
-     * explicitly provided in the `params`.
-     *
-     * @param modelPath The path to the GGUF model file.
-     * @param params The inference parameters to use. If not provided, default values will be used.
-     *   If `contextSize` or `chatTemplate` are not provided in `params`, the values from the GGUF
-     *   model file will be used. If those are also not available in the model file, then default
-     *   values from [DefaultInferenceParams] will be used.
-     * @return `true` if the model was loaded successfully, `false` otherwise.
-     * @throws FileNotFoundException if the model file is not found at the given path.
-     */
     suspend fun load(modelPath: String, params: InferenceParams = InferenceParams()) =
         withContext(Dispatchers.IO) {
             val ggufReader = GGUFReader()
@@ -183,121 +135,116 @@ class SmolLM {
             val modelContextSize = ggufReader.getContextSize() ?: DefaultInferenceParams.contextSize
             val modelChatTemplate =
                 ggufReader.getChatTemplate() ?: DefaultInferenceParams.chatTemplate
-            nativePtr =
-                loadModel(
-                    modelPath,
-                    params.minP,
-                    params.temperature,
-                    params.storeChats,
-                    params.contextSize ?: modelContextSize,
-                    params.chatTemplate ?: modelChatTemplate,
-                    params.numThreads,
-                    params.useMmap,
-                    params.useMlock,
-                )
+            
+            ptrLock.withLock {
+                if (nativePtr != 0L) {
+                    close(nativePtr)
+                    nativePtr = 0L
+                }
+                nativePtr =
+                    loadModel(
+                        modelPath,
+                        params.minP,
+                        params.temperature,
+                        params.storeChats,
+                        params.contextSize ?: modelContextSize,
+                        params.chatTemplate ?: modelChatTemplate,
+                        params.numThreads,
+                        params.useMmap,
+                        params.useMlock,
+                    )
+            }
         }
 
-    /**
-     * Adds a user message to the chat history. This message will be considered as part of the
-     * conversation when generating the next response.
-     *
-     * @param message The user's message.
-     * @throws IllegalStateException if the model is not loaded.
-     */
-    fun addUserMessage(message: String) {
+    fun addUserMessage(message: String) = ptrLock.withLock {
         verifyHandle()
         addChatMessage(nativePtr, message, "user")
     }
 
-    /** Adds the system prompt for the LLM */
-    fun addSystemPrompt(prompt: String) {
+    fun addSystemPrompt(prompt: String) = ptrLock.withLock {
         verifyHandle()
         addChatMessage(nativePtr, prompt, "system")
     }
 
-    /**
-     * Adds the assistant message for LLM inference An assistant message is the response given by
-     * the LLM for a previous query in the conversation
-     */
-    fun addAssistantMessage(message: String) {
+    fun addAssistantMessage(message: String) = ptrLock.withLock {
         verifyHandle()
         addChatMessage(nativePtr, message, "assistant")
     }
 
-    /**
-     * Returns the rate (in tokens per second) at which the LLM generated its last response via
-     * `getResponse()`
-     */
-    fun getResponseGenerationSpeed(): Float {
+    fun getResponseGenerationSpeed(): Float = ptrLock.withLock {
         verifyHandle()
         return getResponseGenerationSpeed(nativePtr)
     }
 
-    /**
-     * Returns the number of tokens consumed by the LLM's context window The context of the LLM is
-     * roughly the output of, tokenize(apply_chat_template(messages_in_conversation))
-     */
-    fun getContextLengthUsed(): Int {
+    fun getContextLengthUsed(): Int = ptrLock.withLock {
         verifyHandle()
         return getContextSizeUsed(nativePtr)
     }
 
-    /**
-     * Return the LLM response to the given query as an async Flow. This is useful for streaming the
-     * response as it is generated by the LLM.
-     *
-     * @param query The query to ask the LLM.
-     * @return A Flow of Strings, where each String is a piece of the response. The flow completes
-     *   when the LLM has finished generating the response. The special token "[EOG]" (End Of
-     *   Generation) indicates the end of the response.
-     * @throws IllegalStateException if the model is not loaded.
-     */
     fun getResponseAsFlow(query: String): Flow<String> = flow {
-        verifyHandle()
-        startCompletion(nativePtr, query)
-        var piece = completionLoop(nativePtr)
-        while (piece != "[EOG]") {
-            emit(piece)
-            piece = completionLoop(nativePtr)
+        ptrLock.withLock {
+            verifyHandle()
+            startCompletion(nativePtr, query)
         }
-        stopCompletion(nativePtr)
+        while (true) {
+            val piece = ptrLock.withLock {
+                completionLoop(nativePtr)
+            }
+            if (piece == "[EOG]") break
+            emit(piece)
+        }
+        ptrLock.withLock {
+            stopCompletion(nativePtr)
+        }
     }
 
     /**
-     * Returns the LLM response to the given query as a String. This function is blocking and will
-     * return the complete response.
-     *
-     * @param query The user's query/prompt for the LLM.
-     * @return The complete response from the LLM.
-     * @throws IllegalStateException if the model is not loaded.
+     * Multimodal version of getResponseAsFlow.
+     * Skips startCompletion as buildVideoChat already evaluated the prompt.
      */
-    fun getResponse(query: String): String {
+    fun getMultimodalResponseAsFlow(): Flow<String> = flow {
+        ptrLock.withLock {
+            verifyHandle()
+        }
+        while (true) {
+            val piece = ptrLock.withLock {
+                completionLoop(nativePtr)
+            }
+            if (piece == "[EOG]") break
+            emit(piece)
+        }
+        ptrLock.withLock {
+            stopCompletion(nativePtr)
+        }
+    }
+
+    fun getResponse(query: String): String = ptrLock.withLock {
         verifyHandle()
         startCompletion(nativePtr, query)
-        var piece = completionLoop(nativePtr)
         var response = ""
-        while (piece != "[EOG]") {
+        while (true) {
+            val piece = completionLoop(nativePtr)
+            if (piece == "[EOG]") break
             response += piece
-            piece = completionLoop(nativePtr)
         }
         stopCompletion(nativePtr)
         return response
     }
 
-    /**
-     * Unloads the LLM model and releases resources. This method should be called when the SmolLM
-     * instance is no longer needed to prevent memory leaks.
-     */
     fun close() {
-        if (nativePtr != 0L) {
-            close(nativePtr)
-            nativePtr = 0L
+        ptrLock.withLock {
+            if (nativePtr != 0L) {
+                close(nativePtr)
+                nativePtr = 0L
+            }
         }
     }
 
     private fun verifyHandle() {
-        assert(nativePtr != 0L) { "Model is not loaded. Use SmolLM.create to load the model" }
+        assert(nativePtr != 0L) { "Model is not loaded. Use SmolLM.load to load the model" }
     }
+
+    // ========== EXISTING TEXT JNI ==========
 
     private external fun loadModel(
         modelPath: String,
@@ -324,4 +271,98 @@ class SmolLM {
     private external fun completionLoop(modelPtr: Long): String
 
     private external fun stopCompletion(modelPtr: Long)
+
+    // ========== NEW MULTIMODAL / VIDEO JNI ==========
+
+    private external fun loadMultimodalModel(
+        modelPath: String,
+        mmprojPath: String,
+        minP: Float,
+        temperature: Float,
+        nGpuLayers: Int,
+        contextSize: Long,
+    ): Long
+
+    private external fun addVideoFrame(
+        modelPtr: Long,
+        data: ByteArray,
+        width: Int,
+        height: Int,
+        channels: Int,
+    )
+
+    private external fun buildMultimodalChat(
+        modelPtr: Long,
+        prompt: String,
+    ): Boolean
+
+    private external fun clearVideoFrames(
+        modelPtr: Long,
+    )
+
+    private external fun getFrameCount(
+        modelPtr: Long,
+    ): Int
+
+    // ========== PUBLIC VIDEO / SmolVLM2 API ==========
+
+    /**
+     * Load SmolVLM2-500M-Video-Instruct + mmproj (video model).
+     */
+    suspend fun loadVideoModel(
+        modelPath: String,
+        mmprojPath: String,
+        minP: Float = 0.05f,
+        temperature: Float = 0.2f,
+        nGpuLayers: Int = 35,
+    ) = withContext(Dispatchers.IO) {
+        val ggufReader = GGUFReader()
+        ggufReader.load(modelPath)
+        val modelContextSize = ggufReader.getContextSize() ?: DefaultInferenceParams.contextSize
+        
+        ptrLock.withLock {
+            if (nativePtr != 0L) {
+                close(nativePtr)
+                nativePtr = 0L
+            }
+            nativePtr = loadMultimodalModel(modelPath, mmprojPath, minP, temperature, nGpuLayers, modelContextSize)
+        }
+    }
+
+    /**
+     * Add one RGB frame (width x height x 3) to the VLM.
+     */
+    fun addVideoFrameRGB(
+        rgbData: ByteArray,
+        width: Int,
+        height: Int,
+    ) {
+        ptrLock.withLock {
+            verifyHandle()
+            addVideoFrame(nativePtr, rgbData, width, height, 3)
+        }
+    }
+
+    /**
+     * Build multimodal chat: all added frames + prompt.
+     */
+    fun buildVideoChat(prompt: String): Boolean = ptrLock.withLock {
+        verifyHandle()
+        return buildMultimodalChat(nativePtr, prompt)
+    }
+
+    /**
+     * Clear buffered frames.
+     */
+    fun clearFrames() {
+        ptrLock.withLock {
+            if (nativePtr != 0L) {
+                clearVideoFrames(nativePtr)
+            }
+        }
+    }
+
+    fun frameCount(): Int = ptrLock.withLock {
+        return if (nativePtr != 0L) getFrameCount(nativePtr) else 0
+    }
 }
